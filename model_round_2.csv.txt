@@ -1,0 +1,9 @@
+home_team,away_team,winner,probability
+Broncos,Eels,Broncos,0.70
+Warriors,Raiders,Warriors,0.55
+Roosters,Rabbitohs,Rabbitohs,0.62
+Tigers,Cowboys,Tigers,0.53
+Dragons,Storm,Storm,0.67
+Panthers,Sharks,Panthers,0.72
+Sea Eagles,Knights,Knights,0.58
+Dolphins,Titans,Dolphins,0.65
