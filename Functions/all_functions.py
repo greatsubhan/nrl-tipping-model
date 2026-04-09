@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 import operator as op
+from pathlib import Path
 import re
 from urllib.request import Request, urlopen
 
@@ -14,6 +15,7 @@ DEFAULT_ELO = 1500.0
 DEFAULT_HOME_ADVANTAGE = 45.0
 DEFAULT_K_FACTOR = 24.0
 DEFAULT_SEASON_CARRYOVER = 0.5
+DEFAULT_FORM_LOOKBACK = 5
 REMOVE_PLAYOFF = True
 
 TEAM_NAME_MAP = {
@@ -58,6 +60,7 @@ CORE_TEAMS = [
     "Cowboys",
     "Knights",
     "Titans",
+    "Dolphins",
 ]
 
 HISTORICAL_COLUMNS = [
@@ -94,6 +97,16 @@ class EloConfig:
     perc_diff_upper_threshold: float = -20.0
     perc_diff_lower_threshold: float = -40.0
     initial_rating: float = DEFAULT_ELO
+    form_lookback: int = DEFAULT_FORM_LOOKBACK
+    elo_weight: float = 0.5
+    form_weight: float = 0.3
+    injury_weight: float = 0.2
+    injury_penalty_per_point: float = 0.035
+    rest_days_target: int = 7
+    fatigue_penalty_per_day: float = 0.015
+    upset_probability_cap: float = 0.72
+    upset_risk_threshold: float = 0.55
+    injury_file: str = "injury_data.csv"
 
 
 def _download_historical_file() -> None:
@@ -132,6 +145,42 @@ def import_data(update_file: bool) -> pd.DataFrame:
 
     raw_df = pd.read_excel("NRL_Historical_Data.xlsx", header=1)
     return _normalise_historical_data(raw_df)
+
+
+def load_injury_data(file_path: str = "injury_data.csv") -> pd.DataFrame:
+    path = Path(file_path)
+    if not path.exists():
+        return pd.DataFrame(columns=["date", "team", "injury_score", "notes"])
+
+    injury_df = pd.read_csv(path)
+    if injury_df.empty:
+        return pd.DataFrame(columns=["date", "team", "injury_score", "notes"])
+
+    injury_df = injury_df.rename(columns=str.lower).copy()
+    required_columns = {"date", "team", "injury_score"}
+    missing_columns = required_columns.difference(injury_df.columns)
+    if missing_columns:
+        raise ValueError(f"Missing injury columns: {sorted(missing_columns)}")
+
+    if "notes" not in injury_df.columns:
+        injury_df["notes"] = ""
+
+    injury_df["team"] = injury_df["team"].replace(TEAM_NAME_MAP)
+    injury_df["date"] = pd.to_datetime(injury_df["date"])
+    injury_df["injury_score"] = pd.to_numeric(injury_df["injury_score"], errors="coerce").fillna(0.0)
+    return injury_df.sort_values(["date", "team"]).reset_index(drop=True)
+
+
+def get_team_injury_score(injury_df: pd.DataFrame, team: str, match_date: pd.Timestamp) -> tuple[float, str]:
+    if injury_df.empty:
+        return 0.0, ""
+
+    eligible_rows = injury_df[(injury_df["team"] == team) & (injury_df["date"] <= match_date)]
+    if eligible_rows.empty:
+        return 0.0, ""
+
+    latest_row = eligible_rows.iloc[-1]
+    return float(latest_row["injury_score"]), str(latest_row.get("notes", ""))
 
 
 def get_prior_season_data(year: int, update_file: bool, past_years: int) -> pd.DataFrame:
@@ -204,6 +253,14 @@ def expected_home_win_probability(home_elo: float, away_elo: float, home_advanta
     return 1 / (1 + 10 ** ((away_elo - (home_elo + home_advantage)) / 400))
 
 
+def _clip_probability(probability: float) -> float:
+    return float(np.clip(probability, 1e-6, 1 - 1e-6))
+
+
+def logistic_from_edge(edge: float, scale: float) -> float:
+    return _clip_probability(1 / (1 + np.exp(-(edge / scale))))
+
+
 def margin_multiplier(margin: float) -> float:
     margin = abs(margin)
     if margin <= 1:
@@ -213,6 +270,153 @@ def margin_multiplier(margin: float) -> float:
     if margin <= 12:
         return 1.3
     return 1.6
+
+
+def get_team_recent_games(history_df: pd.DataFrame, team: str, before_date: pd.Timestamp, lookback: int) -> pd.DataFrame:
+    team_games = history_df[
+        ((history_df["home_team"] == team) | (history_df["away_team"] == team)) & (history_df["date"] < before_date)
+    ].sort_values("date")
+    if lookback > 0:
+        team_games = team_games.tail(lookback)
+    return team_games.reset_index(drop=True)
+
+
+def calculate_recent_form_snapshot(history_df: pd.DataFrame, team: str, before_date: pd.Timestamp, lookback: int) -> dict:
+    recent_games = get_team_recent_games(history_df, team, before_date, lookback)
+    if recent_games.empty:
+        return {
+            "games": 0,
+            "win_rate": 0.5,
+            "average_margin": 0.0,
+            "margin_std": 0.0,
+            "rest_days": 7.0,
+            "games_last_21_days": 0,
+        }
+
+    team_results = []
+    team_margins = []
+    for _, row in recent_games.iterrows():
+        is_home = row["home_team"] == team
+        team_score = row["home_score"] if is_home else row["away_score"]
+        opp_score = row["away_score"] if is_home else row["home_score"]
+        team_results.append(1.0 if team_score > opp_score else 0.5 if team_score == opp_score else 0.0)
+        team_margins.append(float(team_score - opp_score))
+
+    last_game_date = recent_games["date"].max()
+    rest_days = max((before_date - last_game_date).days, 0)
+    recent_window_start = before_date - pd.Timedelta(days=21)
+    games_last_21_days = int((recent_games["date"] >= recent_window_start).sum())
+
+    return {
+        "games": int(len(recent_games)),
+        "win_rate": float(np.mean(team_results)),
+        "average_margin": float(np.mean(team_margins)),
+        "margin_std": float(np.std(team_margins)),
+        "rest_days": float(rest_days),
+        "games_last_21_days": games_last_21_days,
+    }
+
+
+def form_probability(home_form: dict, away_form: dict) -> float:
+    win_rate_edge = (home_form["win_rate"] - away_form["win_rate"]) * 30
+    margin_edge = home_form["average_margin"] - away_form["average_margin"]
+    rest_edge = home_form["rest_days"] - away_form["rest_days"]
+    form_edge = win_rate_edge + margin_edge + (rest_edge * 1.5)
+    return logistic_from_edge(form_edge, scale=12)
+
+
+def injury_probability(home_injury_score: float, away_injury_score: float, home_rest_days: float, away_rest_days: float,
+                       config: EloConfig) -> float:
+    injury_edge = away_injury_score - home_injury_score
+    fatigue_edge = away_rest_days - home_rest_days
+    edge = (injury_edge * 8) + (fatigue_edge * 2)
+    return logistic_from_edge(edge, scale=14)
+
+
+def combine_expert_probabilities(elo_prob: float, form_prob: float, injury_prob: float, config: EloConfig) -> float:
+    total_weight = config.elo_weight + config.form_weight + config.injury_weight
+    combined_probability = (
+        (elo_prob * config.elo_weight)
+        + (form_prob * config.form_weight)
+        + (injury_prob * config.injury_weight)
+    ) / total_weight
+    return _clip_probability(combined_probability)
+
+
+def compute_upset_risk(home_form: dict, away_form: dict, home_injury_score: float, away_injury_score: float,
+                       favorite_side: str, config: EloConfig) -> tuple[float, list[str]]:
+    reasons = []
+    if favorite_side == "home":
+        favorite_form = home_form
+        underdog_form = away_form
+        favorite_injury = home_injury_score
+        underdog_injury = away_injury_score
+    else:
+        favorite_form = away_form
+        underdog_form = home_form
+        favorite_injury = away_injury_score
+        underdog_injury = home_injury_score
+
+    fatigue_days = max(config.rest_days_target - favorite_form["rest_days"], 0)
+    fatigue_risk = min(fatigue_days * config.fatigue_penalty_per_day, 0.3)
+    if fatigue_risk > 0:
+        reasons.append("short_rest")
+
+    schedule_risk = 0.1 if favorite_form["games_last_21_days"] >= 3 else 0.0
+    if schedule_risk > 0:
+        reasons.append("busy_schedule")
+
+    injury_gap = max(favorite_injury - underdog_injury, 0)
+    injury_risk = min(injury_gap * config.injury_penalty_per_point, 0.35)
+    if injury_risk > 0:
+        reasons.append("injury_gap")
+
+    form_risk = 0.12 if favorite_form["win_rate"] < underdog_form["win_rate"] else 0.0
+    if form_risk > 0:
+        reasons.append("recent_form")
+
+    volatility_risk = 0.08 if favorite_form["margin_std"] >= 10 else 0.0
+    if volatility_risk > 0:
+        reasons.append("volatile_results")
+
+    return fatigue_risk + schedule_risk + injury_risk + form_risk + volatility_risk, reasons
+
+
+def apply_upset_adjustment(probability: float, upset_risk: float, config: EloConfig) -> tuple[float, bool]:
+    adjusted_probability = probability
+    upset_flag = upset_risk >= config.upset_risk_threshold
+    if upset_flag:
+        adjusted_probability = min(adjusted_probability, config.upset_probability_cap)
+    elif upset_risk >= config.upset_risk_threshold / 2:
+        adjusted_probability = min(adjusted_probability, config.upset_probability_cap + 0.04)
+
+    return _clip_probability(adjusted_probability), upset_flag
+
+
+def ensemble_vote(home_team: str, away_team: str, expert_probabilities: dict) -> dict:
+    expert_picks = {
+        expert_name: home_team if probability >= 0.5 else away_team
+        for expert_name, probability in expert_probabilities.items()
+    }
+    home_votes = sum(pick == home_team for pick in expert_picks.values())
+    away_votes = len(expert_picks) - home_votes
+    majority_team = home_team if home_votes >= away_votes else away_team
+    majority_votes = max(home_votes, away_votes)
+    if majority_votes == len(expert_picks):
+        confidence_label = "unanimous"
+    elif majority_votes >= 2:
+        confidence_label = "2_of_3"
+    else:
+        confidence_label = "split"
+
+    return {
+        "expert_picks": expert_picks,
+        "home_votes": home_votes,
+        "away_votes": away_votes,
+        "majority_team": majority_team,
+        "majority_votes": majority_votes,
+        "confidence_label": confidence_label,
+    }
 
 
 def regress_ratings_to_mean(elo_dict: dict, initial_elo: float, carryover: float) -> dict:
@@ -269,8 +473,8 @@ def calculate_elo(data_df: pd.DataFrame, elo_dict: dict, k_factor: float, variab
     return elo_dict
 
 
-def _build_prediction_rows(round_data_df: pd.DataFrame, elo_dict: dict, bet_value: float,
-                           home_advantage: float) -> pd.DataFrame:
+def _build_prediction_rows(round_data_df: pd.DataFrame, elo_dict: dict, all_data_df: pd.DataFrame, config: EloConfig,
+                           injury_df: pd.DataFrame) -> pd.DataFrame:
     current_round_df = pd.DataFrame(
         columns=[
             "home_team",
@@ -285,6 +489,19 @@ def _build_prediction_rows(round_data_df: pd.DataFrame, elo_dict: dict, bet_valu
             "exp_value_a",
             "home_win_probability",
             "away_win_probability",
+            "elo_probability",
+            "form_probability",
+            "injury_probability",
+            "home_votes",
+            "away_votes",
+            "ensemble_confidence",
+            "upset_risk",
+            "upset_flag",
+            "upset_reasons",
+            "home_injury_score",
+            "away_injury_score",
+            "home_rest_days",
+            "away_rest_days",
             "winner",
             "probability",
         ]
@@ -298,11 +515,52 @@ def _build_prediction_rows(round_data_df: pd.DataFrame, elo_dict: dict, bet_valu
         away_team = current_round_df.loc[idx, "away_team"]
         home_current_elo = elo_dict[home_team]
         away_current_elo = elo_dict[away_team]
+        match_date = all_data_df["date"].max() + pd.Timedelta(days=1)
+        home_form = calculate_recent_form_snapshot(all_data_df, home_team, match_date, config.form_lookback)
+        away_form = calculate_recent_form_snapshot(all_data_df, away_team, match_date, config.form_lookback)
+        home_injury_score, home_injury_notes = get_team_injury_score(injury_df, home_team, match_date)
+        away_injury_score, away_injury_notes = get_team_injury_score(injury_df, away_team, match_date)
 
-        predict_home = expected_home_win_probability(home_current_elo, away_current_elo, home_advantage)
+        elo_probability = expected_home_win_probability(home_current_elo, away_current_elo, config.home_advantage)
+        form_prob = form_probability(home_form, away_form)
+        injury_prob = injury_probability(
+            home_injury_score,
+            away_injury_score,
+            home_form["rest_days"],
+            away_form["rest_days"],
+            config,
+        )
+        predict_home = combine_expert_probabilities(elo_probability, form_prob, injury_prob, config)
+
+        favorite_side = "home" if predict_home >= 0.5 else "away"
+        upset_risk, upset_reasons = compute_upset_risk(
+            home_form,
+            away_form,
+            home_injury_score,
+            away_injury_score,
+            favorite_side=favorite_side,
+            config=config,
+        )
+        predict_home, upset_flag = apply_upset_adjustment(
+            predict_home if favorite_side == "home" else 1 - predict_home,
+            upset_risk,
+            config,
+        )
+        if favorite_side == "away":
+            predict_home = 1 - predict_home
+
         predict_away = 1 - predict_home
         predict_home_odds = 1 / predict_home
         predict_away_odds = 1 / predict_away
+        vote_summary = ensemble_vote(
+            home_team,
+            away_team,
+            {
+                "elo": elo_probability,
+                "form": form_prob,
+                "injury": injury_prob,
+            },
+        )
 
         home_odds = round_data_df.loc[idx, "home_odds"]
         away_odds = round_data_df.loc[idx, "away_odds"]
@@ -310,8 +568,8 @@ def _build_prediction_rows(round_data_df: pd.DataFrame, elo_dict: dict, bet_valu
         home_percentage_diff = ((predict_home_odds - home_odds) / ((predict_home_odds + home_odds) / 2) * 100)
         away_percentage_diff = ((predict_away_odds - away_odds) / ((predict_away_odds + away_odds) / 2) * 100)
 
-        exp_value_home = (predict_home * ((home_odds * bet_value) - bet_value)) - (predict_away * bet_value)
-        exp_value_away = (predict_away * ((away_odds * bet_value) - bet_value)) - (predict_home * bet_value)
+        exp_value_home = (predict_home * ((home_odds * config.bet_value) - config.bet_value)) - (predict_away * config.bet_value)
+        exp_value_away = (predict_away * ((away_odds * config.bet_value) - config.bet_value)) - (predict_home * config.bet_value)
 
         current_round_df.at[idx, "calc_odds"] = round(predict_home_odds, 2)
         current_round_df.at[idx, "real_odds"] = home_odds
@@ -323,7 +581,24 @@ def _build_prediction_rows(round_data_df: pd.DataFrame, elo_dict: dict, bet_valu
         current_round_df.at[idx, "exp_value_a"] = round(exp_value_away, 2)
         current_round_df.at[idx, "home_win_probability"] = round(predict_home, 4)
         current_round_df.at[idx, "away_win_probability"] = round(predict_away, 4)
-        current_round_df.at[idx, "winner"] = home_team if predict_home >= predict_away else away_team
+        current_round_df.at[idx, "elo_probability"] = round(elo_probability, 4)
+        current_round_df.at[idx, "form_probability"] = round(form_prob, 4)
+        current_round_df.at[idx, "injury_probability"] = round(injury_prob, 4)
+        current_round_df.at[idx, "home_votes"] = vote_summary["home_votes"]
+        current_round_df.at[idx, "away_votes"] = vote_summary["away_votes"]
+        current_round_df.at[idx, "ensemble_confidence"] = vote_summary["confidence_label"]
+        current_round_df.at[idx, "upset_risk"] = round(upset_risk, 3)
+        current_round_df.at[idx, "upset_flag"] = upset_flag
+        current_round_df.at[idx, "upset_reasons"] = ",".join(upset_reasons)
+        current_round_df.at[idx, "home_injury_score"] = home_injury_score
+        current_round_df.at[idx, "away_injury_score"] = away_injury_score
+        current_round_df.at[idx, "home_rest_days"] = round(home_form["rest_days"], 1)
+        current_round_df.at[idx, "away_rest_days"] = round(away_form["rest_days"], 1)
+        if home_injury_notes:
+            current_round_df.at[idx, "upset_reasons"] = ",".join(filter(None, [current_round_df.at[idx, "upset_reasons"], f"home_notes:{home_injury_notes}"]))
+        if away_injury_notes:
+            current_round_df.at[idx, "upset_reasons"] = ",".join(filter(None, [current_round_df.at[idx, "upset_reasons"], f"away_notes:{away_injury_notes}"]))
+        current_round_df.at[idx, "winner"] = vote_summary["majority_team"]
         current_round_df.at[idx, "probability"] = round(max(predict_home, predict_away), 4)
 
     return current_round_df
@@ -332,17 +607,28 @@ def _build_prediction_rows(round_data_df: pd.DataFrame, elo_dict: dict, bet_valu
 def predict_current_round(round_df: pd.DataFrame, all_df: pd.DataFrame, bet_value: float,
                           home_advantage: float = DEFAULT_HOME_ADVANTAGE,
                           k_factor: float = DEFAULT_K_FACTOR,
-                          season_carryover: float = DEFAULT_SEASON_CARRYOVER) -> pd.DataFrame:
+                          season_carryover: float = DEFAULT_SEASON_CARRYOVER,
+                          form_lookback: int = DEFAULT_FORM_LOOKBACK,
+                          injury_file: str = "injury_data.csv") -> pd.DataFrame:
     all_data_df = all_df.sort_values("date").reset_index(drop=True)
+    config = EloConfig(
+        home_advantage=home_advantage,
+        k_factor=k_factor,
+        season_carryover=season_carryover,
+        bet_value=bet_value,
+        form_lookback=form_lookback,
+        injury_file=injury_file,
+    )
+    injury_df = load_injury_data(injury_file)
     team_pool = set(all_data_df["home_team"]).union(all_data_df["away_team"]).union(round_df["home_team"]).union(round_df["away_team"])
     elo_dict = setup_elo(extra_teams=team_pool)
     elo_dict = calculate_elo(
         all_data_df,
         elo_dict,
-        k_factor=k_factor,
+        k_factor=config.k_factor,
         variable_k_factor=False,
-        home_advantage=home_advantage,
-        season_carryover=season_carryover,
+        home_advantage=config.home_advantage,
+        season_carryover=config.season_carryover,
     )
 
     elo_dict_sorted = sorted(elo_dict.items(), key=op.itemgetter(1), reverse=True)
@@ -350,7 +636,7 @@ def predict_current_round(round_df: pd.DataFrame, all_df: pd.DataFrame, bet_valu
     elo_ladder["Elo"] = elo_ladder["Elo"].round(0).astype(int)
     print("\nTeams sorted by Elo rankings:\n" + str(elo_ladder) + "\n")
 
-    current_round_df = _build_prediction_rows(round_df, elo_dict, bet_value, home_advantage)
+    current_round_df = _build_prediction_rows(round_df, elo_dict, all_data_df, config, injury_df)
     print(current_round_df.to_string())
     return current_round_df
 
@@ -400,6 +686,7 @@ def walk_forward_backtest(start_year: int, end_year: int, update_file: bool = Fa
                           show_game_data: bool = False, config: EloConfig | None = None):
     config = config or EloConfig()
     all_games_df = import_data(update_file)
+    injury_df = load_injury_data(config.injury_file)
 
     if past_years is not None:
         min_year = max(start_year - past_years, int(all_games_df["year"].min()))
@@ -423,8 +710,47 @@ def walk_forward_backtest(start_year: int, end_year: int, update_file: bool = Fa
         away_team = row["away_team"]
         home_elo = elo_dict[home_team]
         away_elo = elo_dict[away_team]
-        predict_home = expected_home_win_probability(home_elo, away_elo, config.home_advantage)
+        history_before_match = all_games_df[all_games_df["date"] < row["date"]]
+        home_form = calculate_recent_form_snapshot(history_before_match, home_team, row["date"], config.form_lookback)
+        away_form = calculate_recent_form_snapshot(history_before_match, away_team, row["date"], config.form_lookback)
+        home_injury_score, _ = get_team_injury_score(injury_df, home_team, row["date"])
+        away_injury_score, _ = get_team_injury_score(injury_df, away_team, row["date"])
+
+        elo_probability = expected_home_win_probability(home_elo, away_elo, config.home_advantage)
+        form_prob = form_probability(home_form, away_form)
+        injury_prob = injury_probability(
+            home_injury_score,
+            away_injury_score,
+            home_form["rest_days"],
+            away_form["rest_days"],
+            config,
+        )
+        predict_home = combine_expert_probabilities(elo_probability, form_prob, injury_prob, config)
+        favorite_side = "home" if predict_home >= 0.5 else "away"
+        upset_risk, upset_reasons = compute_upset_risk(
+            home_form,
+            away_form,
+            home_injury_score,
+            away_injury_score,
+            favorite_side=favorite_side,
+            config=config,
+        )
+        favorite_probability, upset_flag = apply_upset_adjustment(
+            predict_home if favorite_side == "home" else 1 - predict_home,
+            upset_risk,
+            config,
+        )
+        predict_home = favorite_probability if favorite_side == "home" else 1 - favorite_probability
         predict_away = 1 - predict_home
+        vote_summary = ensemble_vote(
+            home_team,
+            away_team,
+            {
+                "elo": elo_probability,
+                "form": form_prob,
+                "injury": injury_prob,
+            },
+        )
 
         if start_year <= current_year <= end_year:
             predict_home_odds = 1 / predict_home
@@ -470,9 +796,13 @@ def walk_forward_backtest(start_year: int, end_year: int, update_file: bool = Fa
                     "away_score": row["away_score"],
                     "home_win_probability": predict_home,
                     "away_win_probability": predict_away,
-                    "predicted_winner": home_team if predict_home >= predict_away else away_team,
+                    "elo_probability": elo_probability,
+                    "form_probability": form_prob,
+                    "injury_probability": injury_prob,
+                    "predicted_winner": vote_summary["majority_team"],
+                    "probability": max(predict_home, predict_away),
                     "actual_winner": home_team if actual_home == 1.0 else away_team if actual_home == 0.0 else "Draw",
-                    "correct_tip": (predict_home >= 0.5 and actual_home == 1.0) or (predict_home < 0.5 and actual_home == 0.0),
+                    "correct_tip": vote_summary["majority_team"] == (home_team if actual_home == 1.0 else away_team if actual_home == 0.0 else "Draw"),
                     "actual_home_win": actual_home,
                     "home_odds": home_odds,
                     "away_odds": away_odds,
@@ -485,6 +815,16 @@ def walk_forward_backtest(start_year: int, end_year: int, update_file: bool = Fa
                     "bet_profit": bet_profit,
                     "home_elo_pre": home_elo,
                     "away_elo_pre": away_elo,
+                    "home_votes": vote_summary["home_votes"],
+                    "away_votes": vote_summary["away_votes"],
+                    "ensemble_confidence": vote_summary["confidence_label"],
+                    "upset_risk": upset_risk,
+                    "upset_flag": upset_flag,
+                    "upset_reasons": ",".join(upset_reasons),
+                    "home_injury_score": home_injury_score,
+                    "away_injury_score": away_injury_score,
+                    "home_rest_days": home_form["rest_days"],
+                    "away_rest_days": away_form["rest_days"],
                 }
             )
 
@@ -591,11 +931,12 @@ def tune_elo_model(start_year: int, end_year: int, home_advantages=None, k_facto
     return tuning_df
 
 
-def average_stats(start_year: int, variable_k_factor: bool, years_prior: int):
+def average_stats(start_year: int, variable_k_factor: bool, years_prior: int, show_plot: bool = False):
     season_df = get_prior_season_data(start_year, variable_k_factor, years_prior)
 
-    season_df.plot(x="home_score", y="away_score", kind="scatter", title=f"{start_year} Home vs Away Score")
-    plt.show()
+    if show_plot:
+        season_df.plot(x="home_score", y="away_score", kind="scatter", title=f"{start_year} Home vs Away Score")
+        plt.show()
 
     total_points = season_df["home_score"] + season_df["away_score"]
     average_home_score = float(season_df["home_score"].mean())

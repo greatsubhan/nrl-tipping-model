@@ -4,8 +4,8 @@ import Functions.all_functions as functions
 def main():
     # Walk-forward backtest using stronger Elo defaults found on the historical data.
     functions.walk_forward_backtest(
-        start_year=2013,
-        end_year=2019,
+        start_year=2021,
+        end_year=2025,
         config=functions.EloConfig(
             home_advantage=45,
             k_factor=24,
@@ -18,7 +18,7 @@ def main():
 
     try:
         round_data_df = functions.get_current_round_data()
-        historical_data_df = functions.get_prior_season_data(year=2020, update_file=False, past_years=0)
+        historical_data_df = functions.import_data(update_file=False)
 
         # Calculate elo rankings and predictions for current round
         current_round_predicted = functions.predict_current_round(
