@@ -1,0 +1,9 @@
+date,round_number,home_team,away_team,home_odds,away_odds,venue,bookmaker,source
+2026-04-09,6,Bulldogs,Panthers,1.00,1.00,Accor Stadium,manual,round_6_user_input
+2026-04-10,6,Dragons,Sea Eagles,2.80,1.44,WIN Stadium,manual,round_6_user_input
+2026-04-10,6,Broncos,Cowboys,1.85,1.95,Suncorp Stadium,manual,round_6_user_input
+2026-04-11,6,Rabbitohs,Raiders,1.53,2.50,Optus Stadium,manual,round_6_user_input
+2026-04-11,6,Sharks,Roosters,2.00,1.80,Optus Stadium,manual,round_6_user_input
+2026-04-11,6,Storm,Warriors,1.36,3.20,AAMI Park,manual,round_6_user_input
+2026-04-12,6,Eels,Titans,1.62,2.30,CommBank Stadium,manual,round_6_user_input
+2026-04-12,6,Wests Tigers,Knights,1.62,2.30,Campbelltown Sports Stadium,manual,round_6_user_input
